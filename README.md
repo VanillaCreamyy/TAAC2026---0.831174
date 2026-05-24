@@ -3,7 +3,7 @@
 
 - 模型版本：`baseline_v9_dualhead_tail_calib`
 - 线上 AUC：**0.831174**
-
+![模型分数](score.png)
 该版本整体仍然基于官方 baseline 的 HyFormer / RankMixer 结构，没有完全重写模型。我们的主要思路是在 baseline 主干上补充更有效的数据分布信息，并对高分尾部排序进行轻量校准。
 
 ## 一、最终版本实现了什么
