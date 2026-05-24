@@ -1,4 +1,4 @@
-# TAAC 2026 初赛方案
+# TAAC 2026 学术赛道初赛方案
 本仓库开源的是我们在 TAAC 2026 腾讯广告算法大赛初赛中的最好单模版本：
 
 - 模型版本：`baseline_v9_dualhead_tail_calib`
