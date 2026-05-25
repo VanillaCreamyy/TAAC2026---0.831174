@@ -1,122 +1,257 @@
-# TAAC 2026 学术赛道初赛方案
-本仓库开源的是我们在 TAAC 2026 腾讯广告算法大赛初赛中的最好单模版本：
+# TAAC 2026 初赛方案开源
 
-- 模型版本：`baseline_v9_dualhead_tail_calib`
+本仓库开源的是我们参加 **TAAC 2026 腾讯广告算法大赛初赛** 时的最终单模方案。
+
+最终提交版本为：
+
+- `baseline_v9_dualhead_tail_calib`
 - 线上 AUC：**0.831174**
-![模型分数](score.png)
-该版本整体仍然基于官方 baseline 的 HyFormer / RankMixer 结构，没有完全重写模型。我们的主要思路是在 baseline 主干上补充更有效的数据分布信息，并对高分尾部排序进行轻量校准。
+- 我们复跑的官方 baseline AUC：**0.812927**
+- 相对提升：约 **+0.0182 AUC**
 
-## 一、最终版本实现了什么
+遗憾的是，这个成绩最终没有进入复赛。但整个比赛过程中，我们围绕官方 baseline 做了比较系统的特征工程、模型结构、训练策略和验证方式探索。这个仓库主要希望记录我们认为有效的部分，以及一些容易踩坑的方向，供后来参考。
 
-### 1. 保留官方 baseline 主干
+## 方案概览
 
-最终版本没有大幅 scale up 模型，而是保留了官方 baseline 的主体结构：
+最终方案整体仍然基于官方 baseline 的 HyFormer / RankMixer 主干，没有完全重写模型，也没有做大规模 scale up。
 
-- HyFormer 主干
-- RankMixer NS tokenizer
-- sparse embedding
-- dense tokenizer
-- sequence encoder
-- BCE / auxiliary loss 训练框架
-- sparse embedding re-init 策略
+我们最后的主要思路是：
 
-这样做的原因是，初赛数据规模不大，盲目加深、加宽模型很容易过拟合。我们的实验中，很多更复杂的结构在 valid 上表现不错，但线上并不稳定。
+> 在 baseline 主干上补充缺失的数据分布信息和候选 item - 用户历史交互信息，再用 EMA、online proxy 和轻量 tail calibration 提升稳定性与尾部排序。
 
-最终版本更偏向“补信息”和“校准排序”，而不是单纯扩大模型。
+最终版主要包含：
 
-### 2. Raw dense statistics
+- raw user_dense statistics
+- 当前样本时间特征
+- 序列时间特征
+- item-history match / pair clean 特征
+- DIN target-aware sequence reader
+- 多 dense token
+- online proxy 验证与样本加权
+- light pairwise AUC loss
+- label smoothing / logit L2
+- dense EMA
+- dual-head tail calibration
 
-我们发现 `user_dense` 特征非常重要，而且分布明显重尾。如果直接把所有 dense 特征压成少量 token，模型会损失一部分尾部分布信息。
+## 最终版本：baseline_v9_dualhead_tail_calib
 
-因此最终版本加入了 raw dense statistics，用来描述用户 dense 特征的整体分布形态。
+## 主要改动
 
-主要包括：
+### 1. Raw user_dense statistics
 
-- mean / std / max / min
+`user_dense` 是本赛题里非常重要的一类特征，而且分布明显重尾。直接把 dense 特征压成少量 token，容易损失尾部分布信息。
+
+最终版保留原始 `user_dense`，同时额外追加 32 维统计特征，包括：
+
+- 总和、最大值、L2 norm
 - 非零比例
-- 分位数统计
-- top-k mass
-- high-value mass
-- tail count
-- chunk concentration
-- 稀疏分桶统计
+- 非零均值
+- 最大值占总和比例
+- 大于 1k / 100k 的高值比例
+- 按 chunk 切分后的 sum / max / nonzero ratio
 
-这个方向是最终版本的核心上分点之一。它没有替换原始 dense，而是作为补充信息加入模型，让模型更容易感知用户 dense 的重尾结构。
+这部分是后期最稳定的上分点之一。
 
-### 3. EMA checkpoint
+### 2. 当前样本时间特征
 
-最终版本使用了 dense EMA。
+测试集和时间分布高度相关，因此最终版加入了当前样本时间特征。
 
-EMA 主要用于提升训练后期稳定性。我们观察到某些 epoch 中 raw checkpoint 和 EMA checkpoint 的 valid 表现会有差异，EMA 通常更稳一些。
+Sparse 侧加入：
 
-最终版本在训练中维护 EMA 权重，并使用 EMA checkpoint 作为候选导出权重。
+- hour token
+- weekday token
+- weekday-hour cross token
 
-### 4. Online proxy 验证指标
+Dense 侧加入：
 
-官方 baseline 默认的随机 valid AUC 和线上并不完全一致。我们发现测试集更偏向特定时间段和长历史用户分布，因此最终版本加入了多种验证切片：
+- hour sin / cos
+- weekday sin / cos
+- 是否周一
+- 是否 7~9 点目标时间段
 
-- `all_auc`
-- `target_auc`
-- `hour_auc`
-- `online_long_auc`
-- `online_proxy_auc`
+这样模型可以直接感知当前请求所处的时间上下文。
 
-其中 `online_proxy_auc` 是我们后期用于辅助选择 checkpoint 的指标。它不是线上指标的完美替代，但比只看全量 valid AUC 更稳定。
+### 3. 序列时间特征
 
-### 5. Dual-head tail calibration
+除了当前样本时间，最终版也保留了序列行为的时间信息。
 
-最终版本最关键的模型结构改动是 **dual-head tail calibration**。
+每条序列会构造：
 
-我们观察到 baseline 的整体 AUC 已经不低，但高分尾部样本的排序仍然存在问题。也就是说，模型能大致判断哪些样本更可能转化，但在高置信样本内部，排序仍然不够准。
+- 序列长度比例
+- log length
+- 最近行为时间间隔
+- 平均时间间隔
+- 序列时间跨度
+- 近 1 天 / 近 7 天行为强度
 
-因此我们加入了一个轻量 tail residual head：
+同时，序列 token 中也加入 time bucket embedding，用于表达历史行为距离当前样本的时间差。
 
-- base head 负责主预测；
-- tail head 只对高分尾部做 residual 修正；
-- residual scale 控制 tail head 对最终 logit 的影响；
-- auxiliary loss 约束 base head，防止 tail head 过拟合；
-- 最终输出为 base logit 和 tail residual 的组合。
+### 4. Item-history match / pair clean
 
-这个设计的目标不是重建一个新模型，而是在 baseline 已有排序能力上，修正高分尾部的局部排序错误。
+最终版包含候选 item 和用户历史行为之间的显式匹配统计，也就是 item-history match summaries。
 
-## 二、有效 work 点和分数提升
+对每条行为序列，我们统计候选 item sparse 特征和历史行为 sparse 特征之间的匹配情况，包括：
 
-下面是最终版本相关的主要提升路径。分数不是严格单变量消融，因为不同版本之间会同时包含若干改动，且线上存在随机波动，因此仅作为方向参考。
+- 总匹配数
+- 有匹配的历史事件数
+- 是否存在匹配
+- 第 1 个位置、前 10、前 50 的匹配比例
+- 最近匹配强度
+- 第一次 / 最后一次匹配位置
+- 有匹配的 feature 数
+- 匹配事件距离当前样本的最小 / 平均时间差
+- 1 天 / 7 天 / 30 天内匹配比例
+- 时间衰减后的匹配分数
 
-| 版本 / 改动 | 线上 AUC | 相对 baseline 提升 | 说明 |
-|---|---:|---:|---|
-| 官方 baseline 复跑 | 0.812927 | - | 我们本地复跑后提交的 baseline 分数 |
-| 时间 / token 早期优化版本 | 0.823186 | +0.010259 | 说明时间信息和 token 处理对线上有明显帮助 |
-| dense stats + EMA 方向 | 0.829781 | +0.016854 | raw dense statistics 是后期最稳定的上分点 |
-| dual-head stable 版本 | 0.830541 | +0.017614 | dual-head 校准结构带来进一步提升 |
-| 最终版本 `baseline_v9_dualhead_tail_calib` | **0.831174** | **+0.018247** | raw dense stats + EMA + online proxy + tail calibration 的组合版本 |
+同时忽略 `<=2` 的值，减少 padding、missing、小命名空间类别导致的伪匹配。
 
-最终版本相比 baseline 提升约 **+0.0182 AUC**。
+这部分可以理解为一种更克制的 pair 特征：不直接记忆 pair，而是补充候选 item 与用户历史兴趣之间的显式交互信号。
 
-## 三、为什么这个版本有效
+### 5. DIN target-aware sequence reader
 
-我们认为最终版本有效，主要来自三点。
+最终版加入了 DIN 风格的 target-aware pooling。
 
-### 1. 补回了 user_dense 的重尾信息
+大致流程：
 
-`user_dense` 中包含大量重尾分布信息。直接压缩会损失细节，而 raw dense statistics 可以帮助模型理解 dense 特征的整体分布形态。
+1. 用 item 侧 token 聚合出 `item_anchor`；
+2. 用 `item_anchor` 作为 query，对四条用户行为序列分别做 DIN attention；
+3. 得到每条序列的 target-aware context；
+4. 使用 domain gate 融合四条序列；
+5. 通过 residual 方式加回 HyFormer 输出。
 
-这类特征对线上比较稳定，是最终版本的基础收益来源。
+DIN residual 最后一层是零初始化的，因此训练初始等价于原模型，后续逐渐学习候选 item 与历史行为之间的交互。
 
-### 2. checkpoint 选择更贴近线上
+### 6. 多 dense token
 
-只看全量 valid AUC 容易误判。最终版本加入了 online proxy 和多个时间 / 长历史切片指标，帮助我们选择更接近线上分布的 checkpoint。
+最终版使用：
 
-### 3. 高分尾部排序被轻量修正
+```text
+user_dense_tokens=5
+item_dense_tokens=1
+```
 
-AUC 的提升往往来自排序细节。最终版本没有大幅改变主干，而是通过 tail residual head 对高分尾部做轻量校准。
+测试集中 item_dense 为空，但 user_dense 会被切成多个 dense token，减少过早压缩 dense 信息的问题。
 
-这个改动比较克制，不会像重型 MoE 或 stage2 finetune 那样明显破坏整体排序，因此线上更稳定。
+### 7. Online proxy 验证与样本加权
 
-## 四、最终结论
+官方 valid AUC 和线上分布并不完全一致。我们发现测试集更偏向目标时间段和长历史用户，因此构造了 `online_proxy_auc` 辅助选 checkpoint。
 
-我们的最终方案可以概括为：
+`online_proxy_auc` 综合考虑：
 
-> 在官方 baseline 主干上，加入 raw dense statistics 补充用户重尾分布信息，使用 EMA 提升训练稳定性，通过 online proxy 选择更接近线上分布的 checkpoint，并使用 dual-head tail calibration 修正高分尾部排序。
+- target time AUC
+- online long-history AUC
+- all valid AUC
+- hour AUC
 
-最终单模线上 AUC 为 **0.831174**。
+训练时也使用：
+
+```text
+sample_weight_mode=online_proxy
+```
+
+对目标时间段和长历史样本做轻微加权。
+
+### 8. Light pairwise AUC loss
+
+最终版在 BCE 之外加入了轻量 pairwise AUC loss：
+
+```text
+rank_loss_weight=0.05
+rank_loss_temperature=1.0
+rank_loss_max_pairs=8192
+```
+
+这个 loss 用来强化排序能力，但权重较小，避免破坏主 BCE 训练。
+
+### 9. Label smoothing 和 logit L2
+
+为了缓解模型在高分尾部过度自信的问题，最终版加入：
+
+```text
+label_smoothing=0.003
+logit_l2=0.0002
+```
+
+这两个正则都比较轻，主要用于稳定输出。
+
+### 10. Dense EMA
+
+最终版使用 dense 参数 EMA：
+
+```text
+dense_ema_decay=0.999
+dense_ema_start_step=7248
+```
+
+只对 dense 参数做 EMA，不对 sparse embedding 做 EMA，因为 sparse embedding 仍然保留每轮 re-init 策略。
+
+EMA 主要用于提升 checkpoint 稳定性。
+
+### 11. Dual-head tail calibration
+
+最终版加入 gated tail residual head，用于修正高分尾部排序。
+
+形式上：
+
+```text
+base_logit = base_head(output)
+tail_delta = gate(output, din_context, tail_meta) * residual_head(output, din_context, tail_meta)
+final_logit = base_logit + scale * tail_delta
+```
+
+其中：
+
+```text
+tail_residual_scale=0.20
+tail_aux_loss_weight=0.12
+tail_residual_l2=0.0005
+tail_high_score_quantile=0.80
+```
+
+这个模块不是为了重建一个新模型，而是在 baseline 已有排序能力上，对高分尾部做受控修正。
+
+
+
+## 分数记录
+
+| 版本 / 方向                              |     线上 AUC | 说明                                  |
+| ---------------------------------------- | -----------: | ------------------------------------- |
+| 官方 baseline 复跑                       |     0.812927 | 起点                                  |
+| 时间 / token 早期优化                    |     0.823186 | 时间信息和 token 处理明显有效         |
+| DIN + pair clean + timeauc               |     0.827027 | 候选 item 与历史交互开始带来收益      |
+| dense stats + EMA                        |     0.829781 | raw dense statistics 是后期稳定上分点 |
+| dual-head stable                         |     0.830541 | tail calibration 稳定带来增益         |
+| 最终版 `baseline_v9_dualhead_tail_calib` | **0.831174** | 最终最好单模                          |
+
+这些分数不是严格单变量消融，因为不同实验之间可能同时包含多个改动，也存在随机种子和 checkpoint 选择影响，仅供方向参考。
+
+## 经验总结
+
+我们认为最终版有效，主要来自以下几点：
+
+1. `user_dense` 重尾信息非常重要，raw dense statistics 能补回 dense token 压缩损失的信息；
+2. 当前样本时间和序列时间都对线上分布有帮助；
+3. 候选 item 与用户历史行为之间的显式匹配信息是有效的；
+4. DIN residual 可以补充 target-aware sequence interaction；
+5. 只看全量 valid AUC 容易误判，online proxy 对选点有帮助；
+6. pairwise AUC loss、label smoothing、logit L2 能轻微改善排序和过置信；
+7. dense EMA 能提升 checkpoint 稳定性；
+8. tail calibration 对高分尾部排序有帮助，但必须克制，过强容易过拟合。
+
+## 失败经验
+
+我们也尝试过一些更激进的方向，包括：
+
+- 更大的模型
+- 更长序列
+- MoE
+- stage2 tail finetune
+- sparse lock
+- 更复杂的 tail meta
+- 更强的 target reweight
+- fulltrain tiny valid
+
+很多版本在 valid 上看起来不错，但线上并不稳定，甚至明显掉分。
+
+因此最终版本选择了相对克制的路线：不大幅 scale up 主干，而是补充信息、改进验证、轻量校准。
+
